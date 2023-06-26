@@ -52,7 +52,7 @@ python3 -m torch.distributed.launch --master_port=${MASTER_PORT} ../../evaluate.
 data=$DATADIR/refcoco_data/refcocoplus_testA.tsv
 
 split='refcocoplus_testA'
-python3 -m torch.distributed.launch --nproc_per_node=${GPUS_PER_NODE} --master_port=${MASTER_PORT} ../../evaluate.py \
+python3 -m torch.distributed.launch --master_port=${MASTER_PORT} ../../evaluate.py \
     ${data} \
     --path=${path} \
     --user-dir=${user_dir} \
@@ -75,7 +75,7 @@ python3 -m torch.distributed.launch --nproc_per_node=${GPUS_PER_NODE} --master_p
 data=$DATADIR/refcoco_data/refcocoplus_testB.tsv
 
 split='refcocoplus_testB'
-python3 -m torch.distributed.launch --nproc_per_node=${GPUS_PER_NODE} --master_port=${MASTER_PORT} ../../evaluate.py \
+python3 -m torch.distributed.launch --master_port=${MASTER_PORT} ../../evaluate.py \
     ${data} \
     --path=${path} \
     --user-dir=${user_dir} \

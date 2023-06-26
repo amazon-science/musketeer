@@ -70,10 +70,12 @@ bash evaluate_refcoco_base.sh your_checkpoint_file
 ```
 replace `your_checkpoint_file` with your trained model file dir.
 
+For evaluating other tasks, please use the scripts in `run_scripts`.
+
 # Related Codebase
 We thanks following (but not limited to) researchers for sharing their code,
 * [OFA](https://github.com/OFA-Sys/OFA)
-* [Fairseq](https://github.com/pytorch/fairseq)
+* [fairseq](https://github.com/pytorch/fairseq)
 
 # Acknowledgement
 This code was developed by [Zhaoyang Zhang](https://zzyfd.github.io/#/) while he was interning at the AWS Rekognition Team.

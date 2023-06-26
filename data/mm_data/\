@@ -1,0 +1,462 @@
+# Copyright 2022 The OFA-Sys Team.
+# All rights reserved.
+# This source code is licensed under the Apache 2.0 license
+# found in the LICENSE file in the root directory.
+
+from io import BytesIO
+
+import logging
+import warnings
+import numpy as np
+import torch
+
+from PIL import Image, ImageFile
+from data import data_utils
+from data.ofa_dataset import OFADataset
+from data.mm_data.refcoco_dataset import RefcocoDataset
+from data.mm_data.snli_ve_dataset import SnliVeDataset
+from data.mm_data.caption_dataset import CaptionDataset
+from data.mm_data.vqa_gen_dataset import VqaGenDataset
+from utils.trie import Trie
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+ImageFile.MAX_IMAGE_PIXELS = None
+Image.MAX_IMAGE_PIXELS = None
+
+logger = logging.getLogger(__name__)
+warnings.filterwarnings("ignore", "(Possibly )?corrupt EXIF data", UserWarning)
+
+
+def collate(samples, pad_idx, eos_idx):
+    if len(samples) == 0:
+        return {}
+
+    def merge(key):
+        return data_utils.collate_tokens(
+            [s[key] for s in samples],
+            pad_idx,
+            eos_idx=eos_idx,
+        )
+
+    id = np.array([s["id"] for s in samples])
+    src_tokens = merge("source")
+    src_lengths = torch.LongTensor([s["source"].ne(pad_idx).long().sum() for s in samples])
+
+    patch_images = torch.stack([sample['patch_image'] for sample in samples], dim=0)
+    patch_masks = torch.cat([sample['patch_mask'] for sample in samples])
+
+    code_masks = None
+    if samples[0].get("code_mask", None) is not None:
+        code_masks = torch.cat([sample['code_mask'] for sample in samples])
+    try:
+        conf = torch.cat([s['conf'] for s in samples], dim=0)
+    except:
+        conf = None
+
+    prev_output_tokens = None
+    target = None
+    if samples[0].get("target", None) is not None:
+        target = merge("target")
+        tgt_lengths = torch.LongTensor([s["target"].ne(pad_idx).long().sum() for s in samples])
+        ntokens = tgt_lengths.sum().item()
+
+        if samples[0].get("prev_output_tokens", None) is not None:
+            prev_output_tokens = merge("prev_output_tokens")
+    else:
+        ntokens = src_lengths.sum().item()
+
+    batch = {
+        "id": id,
+        "nsentences": len(samples),
+        "ntokens": ntokens,
+        "net_input": {
+            "src_tokens": src_tokens,
+            "src_lengths": src_lengths,
+            "patch_images": patch_images,
+            "patch_masks": patch_masks,
+            "code_masks": code_masks,
+            "prev_output_tokens": prev_output_tokens
+        },
+        "target": target,
+        "conf": conf
+    }
+
+    return batch
+
+
+class JointDataset_SNREF(OFADataset):
+    def __init__(
+            self,
+            split,
+            dataset,
+            bpe,
+            src_dict,
+            tgt_dict=None,
+            max_src_length=128,
+            max_tgt_length=30,
+            seed=7,
+            code_dict_size=8192,
+            num_bins=1000,
+            patch_image_size=384,
+            code_image_size=128,
+            ref_dataset=None,
+    ):
+        super().__init__(split, dataset, bpe, src_dict, tgt_dict)
+        self.sn_dataset = SnliVeDataset(split, dataset, bpe,
+                                        src_dict,
+                                        tgt_dict, max_src_length, max_tgt_length, patch_image_size,
+                                        )
+        self.seed = seed
+        self.ref_dataset = RefcocoDataset(split, ref_dataset, bpe,
+                                          src_dict,
+                                          tgt_dict, max_src_length, max_tgt_length, patch_image_size, num_bins=num_bins
+                                          )
+
+    def set_epoch(self, epoch, **unused):
+        self.epoch = epoch
+
+    def get_main_set(self):
+        return self.sn_dataset if len(self.sn_dataset) > len(self.ref_dataset) else self.ref_dataset
+
+    def __len__(self):
+        return max(len(self.sn_dataset), len(self.ref_dataset))
+
+    def __getitem__(self, index):
+        with data_utils.numpy_seed(self.seed, self.epoch):
+            sn_samples = self.sn_dataset[index] if index < len(self.sn_dataset) else None
+            ref_samples = self.ref_dataset[index] if index < len(self.ref_dataset) else None
+
+        # print(len(sn_samples), len(ref_samples))
+        return sn_samples, ref_samples
+
+    def collater(self, samples, pad_to_length=None):
+
+        samples_v1 = []
+        samples_v2 = []
+
+        for sample_tuple in samples:
+            if sample_tuple[0] is not None:
+                samples_v1.append(sample_tuple[0])
+            if sample_tuple[1] is not None:
+                samples_v2.append(sample_tuple[1])
+
+        res_v1 = self.sn_dataset.collate(samples_v1, pad_idx=self.src_dict.pad(),
+                                         eos_idx=self.eos) if samples_v1 != [] else None
+        res_v2 = self.ref_dataset.collate(samples_v2, pad_idx=self.src_dict.pad(),
+                                          eos_idx=self.eos) if samples_v2 != [] else None
+        return res_v1, res_v2
+
+
+class JointDataset_SNCAP(OFADataset):
+    def __init__(
+            self,
+            cfg,
+            split,
+            dataset,
+            bpe,
+            src_dict,
+            sn_task,
+            cap_task,
+            tgt_dict=None,
+            max_src_length=128,
+            max_tgt_length=30,
+            seed=7,
+            code_dict_size=8192,
+            num_bins=1000,
+            patch_image_size=384,
+            code_image_size=128,
+            cap_dataset=None,
+
+    ):
+        super().__init__(split, dataset, bpe, src_dict, tgt_dict)
+        self.cfg = cfg
+        self.sn_dataset = SnliVeDataset(split, dataset, bpe,
+                                        src_dict,
+                                        tgt_dict, max_src_length, max_tgt_length, patch_image_size,
+                                        add_caption=self.cfg.add_caption,
+                                        constraint_trie=sn_task.constraint_trie,
+                                        imagenet_default_mean_and_std=self.cfg.imagenet_default_mean_and_std,
+                                        prompt_type=self.cfg.prompt_type
+                                        )
+
+        self.seed = seed
+        self.cap_dataset = CaptionDataset(split, cap_dataset, bpe,
+                                          src_dict,
+                                          tgt_dict, max_src_length, max_tgt_length, patch_image_size,
+                                          imagenet_default_mean_and_std=self.cfg.imagenet_default_mean_and_std,
+                                          scst=getattr(self.cfg, 'scst', False)
+                                          )
+
+        print(len(self.sn_dataset), len(self.cap_dataset))
+
+    def set_epoch(self, epoch, **unused):
+        self.epoch = epoch
+
+    def get_main_set(self):
+        return self.sn_dataset if len(self.sn_dataset) > len(self.cap_dataset) else self.cap_dataset
+
+    def __len__(self):
+        return max(len(self.sn_dataset), len(self.cap_dataset)) // 10
+
+    def __getitem__(self, index):
+        with data_utils.numpy_seed(self.seed, self.epoch):
+            ## Uniform sample balancing
+
+            sn_samples = self.sn_dataset[index % len(self.sn_dataset)]
+            cap_samples = self.cap_dataset[index % len(self.cap_dataset)]
+
+            # sn_samples = self.sn_dataset[index] if index < len(self.sn_dataset) else None
+            # cap_samples = self.cap_dataset[index] if index < len(self.cap_dataset) else None
+
+        # print(len(sn_samples), len(ref_samples))
+        return sn_samples, cap_samples
+
+    def collater(self, samples, pad_to_length=None):
+
+        samples_v1 = []
+        samples_v2 = []
+
+        for sample_tuple in samples:
+
+            if sample_tuple[0] is not None:
+                samples_v1.append(sample_tuple[0])
+            if sample_tuple[1] is not None:
+                samples_v2.append(sample_tuple[1])
+
+        res_v1 = self.sn_dataset.collate(samples_v1, pad_idx=self.src_dict.pad(),
+                                         eos_idx=self.eos)  # if samples_v1 != [] else None
+
+        res_v2 = self.cap_dataset.collate(samples_v2, pad_idx=self.src_dict.pad(),
+                                          eos_idx=self.eos)  # if samples_v2 != [] else None
+
+        return res_v1, res_v2
+
+
+class JointDatasetV1(OFADataset):
+
+    def __init__(
+            self,
+            cfg,
+            split,
+            dataset,
+            bpe,
+            src_dict,
+            sn_task,
+            cap_task,
+            tgt_dict=None,
+            max_src_length=128,
+            max_tgt_length=30,
+            seed=7,
+            code_dict_size=8192,
+            num_bins=1000,
+            patch_image_size=384,
+            code_image_size=128,
+            cap_dataset=None,
+            ref_dataset=None
+
+    ):
+        super().__init__(split, dataset, bpe, src_dict, tgt_dict)
+        self.cfg = cfg
+        self.sn_dataset = SnliVeDataset(split, dataset, bpe,
+                                        src_dict,
+                                        tgt_dict, max_src_length, max_tgt_length, patch_image_size,
+                                        add_caption=self.cfg.add_caption,
+                                        constraint_trie=sn_task.constraint_trie,
+                                        imagenet_default_mean_and_std=self.cfg.imagenet_default_mean_and_std,
+                                        prompt_type=self.cfg.prompt_type
+                                        )
+
+        self.seed = seed
+        self.cap_dataset = CaptionDataset(split, cap_dataset, bpe,
+                                          src_dict,
+                                          tgt_dict, max_src_length, max_tgt_length, patch_image_size,
+                                          imagenet_default_mean_and_std=self.cfg.imagenet_default_mean_and_std,
+                                          scst=getattr(self.cfg, 'scst', False)
+                                          )
+        self.ref_dataset = RefcocoDataset(split, ref_dataset, bpe,
+                                          src_dict,
+                                          tgt_dict, max_src_length, max_tgt_length, patch_image_size, num_bins=num_bins,
+                                          imagenet_default_mean_and_std=cfg.imagenet_default_mean_and_std,
+                                          max_image_size=cfg.max_image_size
+                                          )
+
+        print(len(self.sn_dataset), len(self.cap_dataset), len(ref_dataset))
+
+    def set_epoch(self, epoch, **unused):
+        self.epoch = epoch
+
+    def get_main_set(self):
+        return self.sn_dataset if len(self.sn_dataset) > len(self.cap_dataset) else self.cap_dataset
+
+    def __len__(self):
+        return max(len(self.sn_dataset), len(self.cap_dataset), len(self.ref_dataset))
+
+    def __getitem__(self, index):
+        with data_utils.numpy_seed(self.seed, self.epoch):
+            ## Uniform sample balancing
+
+            sn_samples = self.sn_dataset[index % len(self.sn_dataset)]
+            cap_samples = self.cap_dataset[index % len(self.cap_dataset)]
+            ref_samples = self.ref_dataset[index % len(self.ref_dataset)]
+
+            # sn_samples = self.sn_dataset[index] if index < len(self.sn_dataset) else None
+            # cap_samples = self.cap_dataset[index] if index < len(self.cap_dataset) else None
+
+        # print(len(sn_samples), len(ref_samples))
+        return sn_samples, ref_samples, cap_samples
+
+    def collater(self, samples, pad_to_length=None):
+
+        samples_v1 = []
+        samples_v2 = []
+        samples_v3 = []
+
+        for sample_tuple in samples:
+
+            if sample_tuple[0] is not None:
+                samples_v1.append(sample_tuple[0])
+            if sample_tuple[1] is not None:
+                samples_v2.append(sample_tuple[1])
+            if sample_tuple[2] is not None:
+                samples_v3.append(sample_tuple[2])
+
+        res_v1 = self.sn_dataset.collate(samples_v1, pad_idx=self.src_dict.pad(),
+                                         eos_idx=self.eos)  # if samples_v1 != [] else None
+
+        res_v2 = self.ref_dataset.collate(samples_v2, pad_idx=self.src_dict.pad(),
+                                          eos_idx=self.eos)  # if samples_v2 != [] else None
+
+        res_v3 = self.cap_dataset.collate(samples_v3, pad_idx=self.src_dict.pad(),
+                                          eos_idx=self.eos)  # if samples_v2 != [] else None
+
+        return res_v1, res_v2, res_v3
+
+
+class JointDatasetV2(OFADataset):
+
+    def __init__(
+            self,
+            cfg,
+            split,
+            dataset,
+            bpe,
+            src_dict,
+            sn_task,
+            cap_task,
+            tgt_dict=None,
+            max_src_length=128,
+            max_tgt_length=30,
+            seed=7,
+            code_dict_size=8192,
+            num_bins=1000,
+            patch_image_size=384,
+            code_image_size=128,
+            cap_dataset=None,
+            ref_dataset=None,
+            vqa_dataset=None,
+
+    ):
+        super().__init__(split, dataset, bpe, src_dict, tgt_dict)
+        self.cfg = cfg
+        self.seed = seed
+        self.subsample = 10 if split == 'train' else 10
+
+        self.sn_dataset = SnliVeDataset(split, dataset, bpe,
+                                        src_dict,
+                                        tgt_dict, max_src_length, max_tgt_length, patch_image_size,
+                                        add_caption=self.cfg.add_caption,
+                                        constraint_trie=sn_task.constraint_trie,
+                                        imagenet_default_mean_and_std=self.cfg.imagenet_default_mean_and_std,
+                                        prompt_type=self.cfg.prompt_type
+                                        )
+
+        self.cap_dataset = CaptionDataset(split, cap_dataset, bpe,
+                                          src_dict,
+                                          tgt_dict, max_src_length, max_tgt_length, patch_image_size,
+                                          imagenet_default_mean_and_std=self.cfg.imagenet_default_mean_and_std,
+                                          scst=getattr(self.cfg, 'scst', False)
+                                          )
+
+        self.ref_dataset = RefcocoDataset(split, ref_dataset, bpe,
+                                          src_dict,
+                                          tgt_dict, max_src_length, max_tgt_length, patch_image_size, num_bins=num_bins,
+                                          imagenet_default_mean_and_std=cfg.imagenet_default_mean_and_std,
+                                          max_image_size=cfg.max_image_size
+                                          )
+
+        self.constraint_trie = Trie(self.tgt_dict.eos())
+
+        self.vqa_dataset = VqaGenDataset(split,
+                                         vqa_dataset,
+                                         bpe,
+                                         src_dict,
+                                         tgt_dict,
+                                         max_src_length=cfg.max_src_length,
+                                         max_object_length=cfg.max_object_length,
+                                         max_tgt_length=cfg.max_tgt_length,
+                                         patch_image_size=cfg.patch_image_size,
+                                         add_object=cfg.add_object,
+                                         constraint_trie=self.constraint_trie,
+                                         imagenet_default_mean_and_std=cfg.imagenet_default_mean_and_std,
+                                         prompt_type=cfg.prompt_type)
+
+        print(len(self.sn_dataset), len(self.cap_dataset), len(ref_dataset), len(vqa_dataset))
+        self.main_set = None
+        self.main_len = 0
+        for curr_set in [self.sn_dataset, self.cap_dataset, self.ref_dataset, self.vqa_dataset]:
+            self.main_set = curr_set if len(curr_set) > self.main_len else self.main_set
+            self.main_len = max(self.main_len,len(curr_set) )
+
+    def set_epoch(self, epoch, **unused):
+        self.epoch = epoch
+
+    def get_main_set(self):
+
+        return self.main_set
+
+    def __len__(self):
+        return len(self.sn_dataset)  #self.main_len // self.subsample
+
+    def __getitem__(self, index):
+        with data_utils.numpy_seed(self.seed, self.epoch):
+            ## Uniform sample balancing
+            subsample = self.subsample
+            sn_samples = self.sn_dataset[index % (len(self.sn_dataset) )]
+            cap_samples = self.cap_dataset[index % (len(self.cap_dataset)// subsample)]
+            ref_samples = self.ref_dataset[index % (len(self.ref_dataset)// subsample)]
+            vqa_samples = self.vqa_dataset[index % (len(self.vqa_dataset)// subsample)]
+
+
+        return sn_samples, ref_samples, cap_samples, vqa_samples
+
+    def collater(self, samples, pad_to_length=None):
+
+        samples_v1 = []
+        samples_v2 = []
+        samples_v3 = []
+        samples_v4 = []
+
+        for sample_tuple in samples:
+
+            if sample_tuple[0] is not None:
+                samples_v1.append(sample_tuple[0])
+            if sample_tuple[1] is not None:
+                samples_v2.append(sample_tuple[1])
+            if sample_tuple[2] is not None:
+                samples_v3.append(sample_tuple[2])
+            if sample_tuple[3] is not None:
+                samples_v4.append(sample_tuple[3])
+
+        res_v1 = self.sn_dataset.collate(samples_v1, pad_idx=self.src_dict.pad(),
+                                         eos_idx=self.eos)  # if samples_v1 != [] else None
+
+        res_v2 = self.ref_dataset.collate(samples_v2, pad_idx=self.src_dict.pad(),
+                                          eos_idx=self.eos)  # if samples_v2 != [] else None
+
+        res_v3 = self.cap_dataset.collate(samples_v3, pad_idx=self.src_dict.pad(),
+                                          eos_idx=self.eos)  # if samples_v3 != [] else None
+
+        res_v4 = self.cap_dataset.collate(samples_v4, pad_idx=self.src_dict.pad(),
+                                          eos_idx=self.eos)  # if samples_v4 != [] else None
+
+        return res_v1, res_v2, res_v3, res_v4

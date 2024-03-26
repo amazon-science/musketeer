@@ -86,7 +86,7 @@ If this code helps your research or project, please cite
 
 ```
 @article{zhang2023musketeer,
-  title={Musketeer (All for One, and One for All): A Generalist Vision-Language Model with Task Explanation Prompts},
+  title={Musketeer: Joint Training for Multi-task Vision Language Model with Task Explanation Prompts},
   author={Zhang, Zhaoyang and Shen, Yantao and Shi, Kunyu and Cai, Zhaowei and Fang, Jun and Deng, Siqi and Yang, Hao and Modolo, Davide and Tu, Zhuowen and Soatto, Stefano},
   journal={arXiv preprint arXiv:2305.07019},
   year={2023}
